@@ -623,7 +623,8 @@ $script:MUSIC_EXT = [System.Collections.Generic.HashSet[string]]::new(
     [string[]]@(
         '.mp3','.flac','.aac','.ogg','.opus','.wma','.m4a','.wav',
         '.aiff','.aif','.ape','.wv','.tta','.mka','.dsf','.dff',
-        '.alac','.m4b','.mpc','.ofr','.spx','.ra','.mid','.midi'
+        '.alac','.m4b','.mpc','.ofr','.spx','.ra','.mid','.midi',
+		'.dts'
     ),
     [System.StringComparer]::OrdinalIgnoreCase
 )
@@ -1499,9 +1500,11 @@ $script:scanBlock = {
             # Ignorer les fichiers vides (0 octet) dans tous les modes
             if ($_.Length -eq 0) { return }
             $ext = $_.Extension.ToLower()
-            if ($mode -eq 'fichiers' -or
-                $mode -eq 'musique'  -and $musicExt.Contains($ext) -or
-                $mode -ne 'fichiers' -and $mode -ne 'musique' -and $videoExt.Contains($ext)) {
+            if (
+                ($mode -eq 'fichiers') -or
+                ($mode -eq 'musique'  -and $musicExt.Contains($ext)) -or
+                ($mode -ne 'fichiers' -and $mode -ne 'musique' -and $videoExt.Contains($ext))
+            ) {
                 $allFiles.Add($_)
             }
         }
@@ -1615,7 +1618,6 @@ $script:scanBlock = {
         }
 
         # ════ PHASE 4 : Détection par titre normalisé (45→100%) ════
-        {
             $bArr = @($buckets.GetEnumerator())
             $bT = $bArr.Count; $bD = 0
 
@@ -1696,7 +1698,6 @@ $script:scanBlock = {
                     if ($cluster.Count -gt 1) { $used.Add($fi.FullName) | Out-Null; $groups.Add($cluster) }
                 }
             }
-        }
 
         $state.Progress = 100
         $state.StepMsg  = $T.ScanDone
