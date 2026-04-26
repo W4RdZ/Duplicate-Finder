@@ -1327,40 +1327,74 @@ $script:scanBlock = {
         [hashtable]$T
     )
 
-    $mode = $state.Mode   # video | films | series | fichiers | musique
+    $mode    = $state.Mode
+    $nCpu    = [Math]::Max(2, [Environment]::ProcessorCount)
+    # Threads MediaInfo : on laisse 1 cœur au reste du système
+    $nMIThrd = [Math]::Max(1, $nCpu - 1)
 
-    # ── Lecture metadata MediaInfo (retourne hashtable ou $null) ──────
-    function Get-MediaInfoMeta {
-        param([string]$fullPath)
-        if (-not $mediaInfoPath) { return $null }
-        try {
-            $raw = & $mediaInfoPath --Output=CSV --Inform="General;%Title%|%Performer%|%Album%|%Track%|%Duration%|%BitRate%|%OverallBitRate%" `
-                   $fullPath 2>$null
-            if (-not $raw) { return $null }
-            $p = $raw -split '\|'
-            return @{
-                Title    = if ($p[0]) { $p[0].Trim() } else { '' }
-                Artist   = if ($p[1]) { $p[1].Trim() } else { '' }
-                Album    = if ($p[2]) { $p[2].Trim() } else { '' }
-                Track    = if ($p[3]) { $p[3].Trim() } else { '' }
-                Duration = if ($p[4]) { [long]$p[4] }  else { 0 }
-                BitRate  = if ($p[5]) { $p[5].Trim() } else { '' }
-            }
-        } catch { return $null }
+    # ════════════════════════════════════════════════════════
+    #  CACHE MEDIAINFO  (ConcurrentDictionary, zéro double-appel)
+    #  Une seule invocation MediaInfo.exe par fichier pour TOUS les champs.
+    #  Valeur $null = sentinel (échec ou absent) pour ne pas retenter.
+    # ════════════════════════════════════════════════════════
+    $miCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+
+    # Scriptblock partagé par les workers MediaInfo (évite la sérialisation de fonctions)
+    $miWorkerBlock = {
+        param([string]$miPath, [string[]]$paths,
+              [System.Collections.Concurrent.ConcurrentDictionary[string,object]]$cache)
+        foreach ($p in $paths) {
+            if ($cache.ContainsKey($p)) { continue }
+            try {
+                $raw = & $miPath --Output=CSV `
+                       --Inform="General;%Title%|%Performer%|%Album%|%Track%|%Duration%|%BitRate%|%OverallBitRate%|%Width%|%Height%" `
+                       $p 2>$null
+                $meta = $null
+                if ($raw) {
+                    $sp = $raw -split '\|'
+                    $meta = @{
+                        Title    = if ($sp.Count -gt 0 -and $sp[0]) { $sp[0].Trim() } else { '' }
+                        Artist   = if ($sp.Count -gt 1 -and $sp[1]) { $sp[1].Trim() } else { '' }
+                        Album    = if ($sp.Count -gt 2 -and $sp[2]) { $sp[2].Trim() } else { '' }
+                        Track    = if ($sp.Count -gt 3 -and $sp[3]) { $sp[3].Trim() } else { '' }
+                        Duration = if ($sp.Count -gt 4 -and $sp[4]) { try { [long]$sp[4] } catch { 0L } } else { 0L }
+                        BitRate  = if ($sp.Count -gt 5 -and $sp[5]) { $sp[5].Trim() } else { '' }
+                        Width    = if ($sp.Count -gt 7 -and $sp[7]) { try { [int]$sp[7]  } catch { 0 } } else { 0 }
+                        Height   = if ($sp.Count -gt 8 -and $sp[8]) { try { [int]$sp[8]  } catch { 0 } } else { 0 }
+                    }
+                }
+                $cache.TryAdd($p, $meta) | Out-Null
+            } catch { $cache.TryAdd($p, $null) | Out-Null }
+        }
     }
 
-    # ── Clé de déduplication musique (metadata > nom) ─────────────────
+    # ── Lecture cache (fallback appel direct si entrée absente) ──
+    function Get-CachedMeta {
+        param([string]$fullPath)
+        $existing = $null
+        if ($miCache.TryGetValue($fullPath, [ref]$existing)) { return $existing }
+        if (-not $mediaInfoPath) { $miCache.TryAdd($fullPath, $null) | Out-Null; return $null }
+        # Pre-fetch manqué (rare) — appel direct
+        $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace(); $rs.Open()
+        $ps = [powershell]::Create(); $ps.Runspace = $rs
+        $ps.AddScript($miWorkerBlock).AddArgument($mediaInfoPath).AddArgument(@($fullPath)).AddArgument($miCache) | Out-Null
+        try { $ps.Invoke() } catch {} finally { $ps.Dispose(); $rs.Close(); $rs.Dispose() }
+        $result = $null; $miCache.TryGetValue($fullPath, [ref]$result) | Out-Null
+        return $result
+    }
+
+    # ── Wrappers métier utilisant le cache ───────────────────
     function Get-MusicKey {
         param([System.IO.FileInfo]$f)
-        $meta = Get-MediaInfoMeta $f.FullName
+        $meta = Get-CachedMeta $f.FullName
         if ($meta -and ($meta.Title -or $meta.Artist)) {
             $title  = ($meta.Title  -replace '[^\w\s]', '' -replace '\s+', ' ').Trim().ToLower()
             $artist = ($meta.Artist -replace '[^\w\s]', '' -replace '\s+', ' ').Trim().ToLower()
-            # Durée arrondie à la seconde (tolérance ±2 s gérée plus bas)
             $durSec = [int]($meta.Duration / 1000)
-            if ($title)  { return "$artist|$title|$durSec" }
+            if ($title) { return "$artist|$title|$durSec" }
         }
-        # Fallback : nom normalisé si pas de metadata
         $n = [System.IO.Path]::GetFileNameWithoutExtension($f.Name).ToLower()
         $n = $n -replace '\b(320|256|192|128|64)k?bps?\b', ''
         $n = $n -replace '\b(v0|v2|q[0-9])\b', ''
@@ -1369,24 +1403,14 @@ $script:scanBlock = {
         return $n.Trim()
     }
 
-    # ── Metadata vidéo via MediaInfo (durée + résolution) ─────────────
     function Get-VideoMeta {
         param([string]$fullPath)
-        if (-not $mediaInfoPath) { return $null }
-        try {
-            $raw = & $mediaInfoPath --Output=CSV --Inform="General;%Duration%|%Width%|%Height%" `
-                   $fullPath 2>$null
-            if (-not $raw) { return $null }
-            $p = $raw -split '\|'
-            return @{
-                Duration = if ($p[0]) { [long]$p[0] } else { 0 }
-                Width    = if ($p[1]) { [int]$p[1]  } else { 0 }
-                Height   = if ($p[2]) { [int]$p[2]  } else { 0 }
-            }
-        } catch { return $null }
+        $meta = Get-CachedMeta $fullPath
+        if (-not $meta) { return $null }
+        return @{ Duration = $meta.Duration; Width = $meta.Width; Height = $meta.Height }
     }
 
-    # ── Normalisation commune (supprime codec/résolution/source) ────
+    # ── Normalisations (logique identique, noms inchangés) ───
     function Normalize-Base {
         param([string]$name)
         $n = [System.IO.Path]::GetFileNameWithoutExtension($name).ToLower()
@@ -1403,7 +1427,6 @@ $script:scanBlock = {
         return $n.Trim()
     }
 
-    # ── Normalisation vidéo générale (supprime aussi l'année et épisodes) ──
     function Normalize-VideoName {
         param([string]$name)
         $n = Normalize-Base $name
@@ -1416,43 +1439,30 @@ $script:scanBlock = {
         return $n.Trim()
     }
 
-    # ── Normalisation films (conserve l'année comme discriminant) ──
     function Normalize-Film {
         param([string]$name)
         $n = Normalize-Base $name
-        # Extraire l'année si présente, la normaliser en suffixe fixe
         $year = ''
         if ($n -match '\b((19|20)\d{2})\b') { $year = $Matches[1] }
         $n = $n -replace '\b(19|20)\d{2}\b', ''
-        $n = $n -replace '[._\-\s]+', ' '
-        $n = $n.Trim()
+        $n = ($n -replace '[._\-\s]+', ' ').Trim()
         if ($year) { $n = "$n $year" }
         return $n
     }
 
-    # ── Extraction du code episode canonique ────────────────
-    # Reconnait : S01E02, 1x02, Episode 5, ep5, et numero absolu (Naruto 040)
     function Get-EpisodeKey {
         param([string]$name)
         $raw = [System.IO.Path]::GetFileNameWithoutExtension($name).ToLower()
-        # Format SxxExx (prioritaire)
         if ($raw -match '(?<![a-z])s(\d{1,3})e(\d{1,3})(?:e\d{1,3})?(?![a-z\d])') {
             return "s$($Matches[1].PadLeft(2,'0'))e$($Matches[2].PadLeft(2,'0'))"
         }
-        # Format NxNN (ex: 7x03, 1x02)
         if ($raw -match '(?<![a-z\d])(\d{1,2})x(\d{2,3})(?!\d)') {
             return "s$($Matches[1].PadLeft(2,'0'))e$($Matches[2].PadLeft(2,'0'))"
         }
-        # Format "episode N" ou "ep N"
-        if ($raw -match 'episode?\s*(\d+)') { return "ep$($Matches[1].PadLeft(3,'0'))" }
-        if ($raw -match 'ep\.?\s*(\d+)')    { return "ep$($Matches[1].PadLeft(3,'0'))" }
-        # Format numero absolu : un nombre de 2-4 chiffres isole dans le nom
-        # ex: "Naruto 040 - titre", "Dragon Ball 123", "One Piece - 105 - titre"
-        # On prend le PREMIER nombre trouve apres un separateur (espace, tiret, underscore)
-        # en excluant les annees (1900-2099) et les tailles/resolutions connues
+        if ($raw -match 'episode?\s*(\d+)') { return "ep$($Matches[1].PadLeft(3,'0'))" }
+        if ($raw -match 'ep\.?\s*(\d+)')    { return "ep$($Matches[1].PadLeft(3,'0'))" }
         if ($raw -match '(?:^|[\s._\-])(\d{2,4})(?:[\s._\-]|$)') {
             $num = $Matches[1]
-            # Exclure annees et resolutions
             if ($num -notmatch '^(19|20)\d{2}$' -and
                 $num -notmatch '^(480|576|720|1080|2160|4320)$') {
                 return "ep$($num.PadLeft(3,'0'))"
@@ -1461,26 +1471,213 @@ $script:scanBlock = {
         return ''
     }
 
-    # ── Normalisation series (conserve saison+episode, supprime le reste) ──
     function Normalize-Serie {
         param([string]$name)
-        # Extraire le code episode canonique sur le nom brut (avant Normalize-Base)
         $ep = Get-EpisodeKey $name
-
-        $n = Normalize-Base $name
-        # Supprimer tous les marqueurs d'episode (SxxExx, NxNN, episode N, ep N)
-        $n = $n -replace 's\d{1,3}e\d{1,3}(?:e\d{1,3})?', ''
-        $n = $n -replace '(?<![a-z\d])\d{1,2}x\d{2,3}(?!\d)', ''
-        $n = $n -replace 'episode?\s*\d+', ''
-        $n = $n -replace 'ep\.?\s*\d+', ''
-        $n = $n -replace '(19|20)\d{2}', ''
-        # Supprimer aussi les numeros absolus (2-4 chiffres isoles)
-        $n = $n -replace '(?:^|[\s])(\d{2,4})(?:[\s]|$)', ' '
-        $n = $n -replace '\s+', ' '
-        $n = $n.Trim()
-        # Reattacher le code episode canonique -> titre+episode = cle unique par episode
+        $n  = Normalize-Base $name
+        $n  = $n -replace 's\d{1,3}e\d{1,3}(?:e\d{1,3})?', ''
+        $n  = $n -replace '(?<![a-z\d])\d{1,2}x\d{2,3}(?!\d)', ''
+        $n  = $n -replace 'episode?\s*\d+', ''
+        $n  = $n -replace 'ep\.?\s*\d+', ''
+        $n  = $n -replace '(19|20)\d{2}', ''
+        $n  = $n -replace '(?:^|[\s])(\d{2,4})(?:[\s]|$)', ' '
+        $n  = ($n -replace '\s+', ' ').Trim()
         if ($ep) { $n = "$n $ep" }
         return $n
+    }
+
+    # ════════════════════════════════════════════════════════
+    #  HELPER : Pre-fetch MediaInfo parallèle
+    #  Lance jusqu'à $nMIThrd runspaces simultanément.
+    #  Remplit $miCache avant les phases de normalisation et comparaison.
+    # ════════════════════════════════════════════════════════
+    function Invoke-ParallelMediaInfo {
+        param(
+            [System.IO.FileInfo[]]$files,
+            [int]$threads,
+            [int]$progStart,
+            [int]$progEnd,
+            [string]$stepLabel
+        )
+        if (-not $mediaInfoPath -or $files.Count -eq 0) {
+            $state.Progress = $progEnd; return
+        }
+        $total     = $files.Count
+        $chunkSize = [Math]::Max(1, [Math]::Ceiling($total / $threads))
+        $jobs      = [System.Collections.Generic.List[object]]::new()
+
+        for ($t = 0; $t -lt $threads; $t++) {
+            $start = $t * $chunkSize
+            if ($start -ge $total) { break }
+            $end   = [Math]::Min($start + $chunkSize - 1, $total - 1)
+            $chunk = [string[]]($files[$start..$end] | ForEach-Object { $_.FullName })
+            $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+            $rs.Open()
+            $ps = [powershell]::Create(); $ps.Runspace = $rs
+            $ps.AddScript($miWorkerBlock).AddArgument($mediaInfoPath).AddArgument($chunk).AddArgument($miCache) | Out-Null
+            $jobs.Add([PSCustomObject]@{ PS=$ps; RS=$rs; Handle=$ps.BeginInvoke() })
+        }
+
+        while ($jobs.Count -gt 0) {
+            if ($state.Cancelled) { foreach ($j in $jobs) { try { $j.PS.Stop() } catch {} }; break }
+            $pending = [System.Collections.Generic.List[object]]::new()
+            foreach ($j in $jobs) {
+                if ($j.Handle.IsCompleted) {
+                    try { $j.PS.EndInvoke($j.Handle) } catch {}
+                    $j.PS.Dispose(); $j.RS.Close(); $j.RS.Dispose()
+                } else { $pending.Add($j) }
+            }
+            $jobs = $pending
+            $done = [Math]::Min($miCache.Count, $total)
+            $state.Progress = $progStart + [int](($done / [Math]::Max($total,1)) * ($progEnd - $progStart))
+            $state.StepMsg  = "$stepLabel [$done/$total]"
+            if ($jobs.Count -gt 0) { [System.Threading.Thread]::Sleep(80) }
+        }
+        # Drain restants (annulation)
+        foreach ($j in $jobs) {
+            try { $j.PS.EndInvoke($j.Handle) } catch {}
+            $j.PS.Dispose(); $j.RS.Close(); $j.RS.Dispose()
+        }
+        $state.Progress = $progEnd
+    }
+
+    # ════════════════════════════════════════════════════════
+    #  HELPER : Normalisation parallèle
+    #  Chaque worker normalise sa tranche et empile les résultats
+    #  dans une ConcurrentQueue[PSCustomObject{Path,Norm}].
+    #  Le cache $miCache est passé en lecture seule (déjà rempli).
+    # ════════════════════════════════════════════════════════
+    function Invoke-ParallelNormalize {
+        param(
+            [System.IO.FileInfo[]]$files,
+            [int]$threads,
+            [int]$progStart,
+            [int]$progEnd
+        )
+        $total   = $files.Count
+        $results = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+
+        # Scriptblock worker — fonctions de normalisation dupliquées localement
+        # car les runspaces ne partagent pas les fonctions du scope parent.
+        $normWorker = {
+            param([System.IO.FileInfo[]]$chunk, [string]$modeStr,
+                  [System.Collections.Concurrent.ConcurrentDictionary[string,object]]$cache,
+                  [System.Collections.Concurrent.ConcurrentQueue[object]]$results)
+
+            function NB([string]$name) {
+                $n = [System.IO.Path]::GetFileNameWithoutExtension($name).ToLower()
+                $n = $n -replace '\b(4k|2160p?|1080[pi]?|720p?|480p?|360p?|240p?|2k|8k|uhd|fhd|hd|sd)\b', ''
+                $n = $n -replace '\b(x\.?264|x\.?265|h\.?264|h\.?265|xvid|divx|avc|hevc|av1|vp[89]|mpeg[-.]?[24]?|wmv[39]?|rv[34][05])\b', ''
+                $n = $n -replace '\b(aac|mp3|ac3|e-?ac3|dts[-.]?(hd|ma|x)?|truehd|atmos|ddp?[257]?\.[01]|flac|opus|vorbis|pcm)\b', ''
+                $n = $n -replace '\b(blu[-.]?ray|bdrip|bdremux|dvdrip|dvdscr|dvd|webrip|web[-.]?dl|webdl|hdtv|pdtv|dsr|hdrip|hdr10?[+]?|sdr|remux|uhdrip|amzn|nf|hulu|dsnp|atvp|pcok)\b', ''
+                $n = $n -replace '\b(10[-.]?bit|8[-.]?bit|hdr|dovi|dolby[-.]?vision|hlg)\b', ''
+                $n = $n -replace '\b(proper|repack|extended|theatrical|directors?[-.]?cut|unrated|dc|sample|trailer|bonus|featurette|extras?|complete|dubbed|subbed|multi|french|vf|vo|vostfr)\b', ''
+                $n = $n -replace '\[.*?\]|\(.*?\)|\{.*?\}', ''
+                return ($n -replace '[._\-\s]+', ' ').Trim()
+            }
+            function GEK([string]$name) {
+                $r = [System.IO.Path]::GetFileNameWithoutExtension($name).ToLower()
+                if ($r -match '(?<![a-z])s(\d{1,3})e(\d{1,3})(?:e\d{1,3})?(?![a-z\d])') { return "s$($Matches[1].PadLeft(2,'0'))e$($Matches[2].PadLeft(2,'0'))" }
+                if ($r -match '(?<![a-z\d])(\d{1,2})x(\d{2,3})(?!\d)')                   { return "s$($Matches[1].PadLeft(2,'0'))e$($Matches[2].PadLeft(2,'0'))" }
+                if ($r -match 'episode?\s*(\d+)') { return "ep$($Matches[1].PadLeft(3,'0'))" }
+                if ($r -match 'ep\.?\s*(\d+)')    { return "ep$($Matches[1].PadLeft(3,'0'))" }
+                if ($r -match '(?:^|[\s._\-])(\d{2,4})(?:[\s._\-]|$)') {
+                    $num = $Matches[1]
+                    if ($num -notmatch '^(19|20)\d{2}$' -and $num -notmatch '^(480|576|720|1080|2160|4320)$') { return "ep$($num.PadLeft(3,'0'))" }
+                }
+                return ''
+            }
+
+            foreach ($f in $chunk) {
+                $norm = switch ($modeStr) {
+                    'films' {
+                        $n = NB $f.Name
+                        $yr = ''; if ($n -match '\b((19|20)\d{2})\b') { $yr = $Matches[1] }
+                        $n = ($n -replace '\b(19|20)\d{2}\b','' -replace '[._\-\s]+',' ').Trim()
+                        if ($yr) { "$n $yr" } else { $n }
+                    }
+                    'series' {
+                        $ep = GEK $f.Name
+                        $n  = NB $f.Name
+                        $n  = ($n -replace 's\d{1,3}e\d{1,3}(?:e\d{1,3})?','' `
+                                  -replace '(?<![a-z\d])\d{1,2}x\d{2,3}(?!\d)','' `
+                                  -replace 'episode?\s*\d+','' -replace 'ep\.?\s*\d+','' `
+                                  -replace '(19|20)\d{2}','' `
+                                  -replace '(?:^|[\s])(\d{2,4})(?:[\s]|$)',' ' `
+                                  -replace '\s+',' ').Trim()
+                        if ($ep) { "$n $ep" } else { $n }
+                    }
+                    'fichiers' {
+                        ([System.IO.Path]::GetFileNameWithoutExtension($f.Name).ToLower() -replace '[._\-\s]+',' ').Trim()
+                    }
+                    'musique' {
+                        $meta = $null; $cache.TryGetValue($f.FullName, [ref]$meta) | Out-Null
+                        if ($meta -and ($meta.Title -or $meta.Artist)) {
+                            $ti = ($meta.Title  -replace '[^\w\s]','' -replace '\s+',' ').Trim().ToLower()
+                            $ar = ($meta.Artist -replace '[^\w\s]','' -replace '\s+',' ').Trim().ToLower()
+                            $du = [int]($meta.Duration / 1000)
+                            if ($ti) { "$ar|$ti|$du" }
+                            else {
+                                $n = [System.IO.Path]::GetFileNameWithoutExtension($f.Name).ToLower()
+                                ($n -replace '\b(320|256|192|128|64)k?bps?\b','' -replace '\b(v0|v2|q[0-9])\b','' -replace '\b(mp3|flac|aac|ogg|opus|wma)\b','' -replace '[._\-\s]+',' ').Trim()
+                            }
+                        } else {
+                            $n = [System.IO.Path]::GetFileNameWithoutExtension($f.Name).ToLower()
+                            ($n -replace '\b(320|256|192|128|64)k?bps?\b','' -replace '\b(v0|v2|q[0-9])\b','' -replace '\b(mp3|flac|aac|ogg|opus|wma)\b','' -replace '[._\-\s]+',' ').Trim()
+                        }
+                    }
+                    default {
+                        $n = NB $f.Name
+                        ($n -replace '\b(19|20)\d{2}\b','' -replace '\bs\d{1,2}(e\d{1,2}){1,3}\b','' `
+                            -replace '\bepisode?\s*\d+\b','' -replace '\bep\.?\s*\d+\b','' `
+                            -replace '\bpart\.?\s*\d+\b','' -replace '[._\-\s]+',' ').Trim()
+                    }
+                }
+                $results.Enqueue([PSCustomObject]@{ Path=$f.FullName; Norm=$norm })
+            }
+        }
+
+        # Lancer les workers
+        $chunkSize = [Math]::Max(1, [Math]::Ceiling($total / $threads))
+        $jobs = [System.Collections.Generic.List[object]]::new()
+        for ($t = 0; $t -lt $threads; $t++) {
+            $start = $t * $chunkSize
+            if ($start -ge $total) { break }
+            $end   = [Math]::Min($start + $chunkSize - 1, $total - 1)
+            $chunk = [System.IO.FileInfo[]]$files[$start..$end]
+            $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace(); $rs.Open()
+            $ps = [powershell]::Create(); $ps.Runspace = $rs
+            $ps.AddScript($normWorker).AddArgument($chunk).AddArgument($mode).AddArgument($miCache).AddArgument($results) | Out-Null
+            $jobs.Add([PSCustomObject]@{ PS=$ps; RS=$rs; Handle=$ps.BeginInvoke() })
+        }
+
+        while ($jobs.Count -gt 0) {
+            if ($state.Cancelled) { foreach ($j in $jobs) { try { $j.PS.Stop() } catch {} }; break }
+            $pending = [System.Collections.Generic.List[object]]::new()
+            foreach ($j in $jobs) {
+                if ($j.Handle.IsCompleted) {
+                    try { $j.PS.EndInvoke($j.Handle) } catch {}
+                    $j.PS.Dispose(); $j.RS.Close(); $j.RS.Dispose()
+                } else { $pending.Add($j) }
+            }
+            $jobs = $pending
+            $state.Progress = $progStart + [int](($results.Count / [Math]::Max($total,1)) * ($progEnd - $progStart))
+            $state.StepMsg  = "$($T.Normalizing) [$($results.Count)/$total]"
+            if ($jobs.Count -gt 0) { [System.Threading.Thread]::Sleep(80) }
+        }
+        foreach ($j in $jobs) {
+            try { $j.PS.EndInvoke($j.Handle) } catch {}
+            $j.PS.Dispose(); $j.RS.Close(); $j.RS.Dispose()
+        }
+
+        # Reconstruire dictionnaire depuis la ConcurrentQueue
+        $dict = [System.Collections.Generic.Dictionary[string,string]]::new(
+            $total, [System.StringComparer]::OrdinalIgnoreCase)
+        $item = $null
+        while ($results.TryDequeue([ref]$item)) {
+            if (-not $dict.ContainsKey($item.Path)) { $dict[$item.Path] = $item.Norm }
+        }
+        return $dict
     }
 
     # ──────────────────────────────────────────────────────
@@ -1489,7 +1686,7 @@ $script:scanBlock = {
         $state.StepMsg  = $T.EnumFiles
         $state.Progress = 2
 
-        # ════ PHASE 1 : Énumération (0→15%) ════
+        # ════ PHASE 1 : Énumération (0→10%) ════
         $allFiles = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
         $enumErr  = @()
 
@@ -1497,66 +1694,66 @@ $script:scanBlock = {
             -ErrorAction SilentlyContinue -ErrorVariable enumErr |
         ForEach-Object {
             if ($state.Cancelled) { return }
-            # Ignorer les fichiers vides (0 octet) dans tous les modes
-            if ($_.Length -eq 0) { return }
+            if ($_.Length -eq 0)  { return }
             $ext = $_.Extension.ToLower()
             if (
                 ($mode -eq 'fichiers') -or
                 ($mode -eq 'musique'  -and $musicExt.Contains($ext)) -or
                 ($mode -ne 'fichiers' -and $mode -ne 'musique' -and $videoExt.Contains($ext))
-            ) {
-                $allFiles.Add($_)
-            }
+            ) { $allFiles.Add($_) }
         }
 
         foreach ($e in $enumErr) { $state.Errors.Enqueue("$($T.AccessDenied) $($e.TargetObject)") }
-
         if ($state.Cancelled) { $state.Groups = [System.Collections.Generic.List[object]]::new(); $state.Phase = 'done'; return }
 
-        $fileList = @($allFiles)
+        $fileList = [System.IO.FileInfo[]]@($allFiles)
         $n        = $fileList.Count
         $state.FilesTotal = $n
-        $state.Progress   = 15
+        $state.Progress   = 10
         $state.StepMsg    = "$n $($T.FilesFound)"
 
         if ($n -eq 0) { $state.Groups = [System.Collections.Generic.List[object]]::new(); $state.Phase = 'done'; return }
 
-        # ════ PHASE 2 : Normalisation + bucketing (15→30%) ════
-        $norms   = [System.Collections.Generic.Dictionary[string,string]]::new($n)
+        # ════ PHASE 2a : Pre-fetch MediaInfo parallèle (10→30%) ════
+        # Tous les champs (titre+artiste+durée+résolution) en une seule passe
+        # sur $nMIThrd processus simultanés. Coût ultérieur des lookup ≈ 0.
+        if ($mode -ne 'fichiers' -and $mediaInfoPath) {
+            $state.StepMsg = "MediaInfo pre-fetch ($nMIThrd threads)..."
+            Invoke-ParallelMediaInfo -files $fileList -threads $nMIThrd `
+                -progStart 10 -progEnd 30 -stepLabel "MediaInfo"
+        } else {
+            $state.Progress = 30
+        }
+        if ($state.Cancelled) { $state.Groups = [System.Collections.Generic.List[object]]::new(); $state.Phase = 'done'; return }
+
+        # ════ PHASE 2b : Normalisation parallèle (30→45%) ════
+        $state.StepMsg = "$($T.Normalizing) ($nCpu threads)..."
+        $norms = Invoke-ParallelNormalize -files $fileList -threads $nCpu `
+            -progStart 30 -progEnd 45
+
+        if ($state.Cancelled) { $state.Groups = [System.Collections.Generic.List[object]]::new(); $state.Phase = 'done'; return }
+
+        # Bucketing séquentiel — O(n) pur, négligeable
+        $state.Progress = 45
         $buckets = [System.Collections.Generic.Dictionary[string,
                     System.Collections.Generic.List[object]]]::new()
-
-        for ($i = 0; $i -lt $n; $i++) {
-            if ($state.Cancelled) { break }
-            $f = $fileList[$i]
-
-            $norm = switch ($mode) {
-                'films'    { Normalize-Film  $f.Name }
-                'series'   { Normalize-Serie $f.Name }
-                'fichiers' { [System.IO.Path]::GetFileNameWithoutExtension($f.Name).ToLower() -replace '[._\-\s]+', ' ' }
-                'musique'  { Get-MusicKey $f }
-                default    { Normalize-VideoName $f.Name }
-            }
-            $norms[$f.FullName] = $norm
-
+        foreach ($f in $fileList) {
+            $norm  = if ($norms.ContainsKey($f.FullName)) { $norms[$f.FullName] } else { '' }
             $words = ($norm -split ' ') | Where-Object { $_.Length -ge 3 }
             $key   = ($words | Select-Object -First 2) -join ' '
             if (-not $key -or $key.Length -lt 2) { $key = '~divers~' }
-
             if (-not $buckets.ContainsKey($key)) {
                 $buckets[$key] = [System.Collections.Generic.List[object]]::new()
             }
             $buckets[$key].Add($f)
-
-            $state.Progress = 15 + [int](($i / $n) * 15)
-            if ($i % 50 -eq 0) { $state.StepMsg = "$($T.Normalizing) [$i/$n] : $($f.Name)" }
         }
 
-        # ════ PHASE 3 : Copies exactes par taille (30→45%) ════
+        # ════ PHASE 3 : Copies exactes par taille (45→60%) ════
+        # Get-VideoMeta lit depuis $miCache — coût ≈ dictionnaire lookup, MediaInfo.exe non relancé
         $state.StepMsg  = $T.ExactCopies
-        $state.Progress = 30
+        $state.Progress = 45
 
-        $bySize  = [System.Collections.Generic.Dictionary[long, System.Collections.Generic.List[object]]]::new()
+        $bySize = [System.Collections.Generic.Dictionary[long, System.Collections.Generic.List[object]]]::new()
         foreach ($f in $fileList) {
             if ($f.Length -gt 0) {
                 if (-not $bySize.ContainsKey($f.Length)) {
@@ -1574,7 +1771,7 @@ $script:scanBlock = {
         foreach ($entry in $sGroups) {
             if ($state.Cancelled) { break }
             $sgD++
-            $state.Progress = 30 + [int](($sgD / [Math]::Max($sg, 1)) * 15)
+            $state.Progress = 45 + [int](($sgD / [Math]::Max($sg, 1)) * 15)
             $sameSize = @($entry.Value)
             $szStr = if ($entry.Key -ge 1GB) { "$([Math]::Round($entry.Key/1GB,2)) $($T.Go)" } `
                      else { "$([Math]::Round($entry.Key/1MB,1)) $($T.Mo)" }
@@ -1583,28 +1780,23 @@ $script:scanBlock = {
             for ($i = 0; $i -lt $sameSize.Count; $i++) {
                 $fi = $sameSize[$i]
                 if ($used.Contains($fi.FullName)) { continue }
-                $cluster = [System.Collections.Generic.List[object]]::new()
+                $cluster     = [System.Collections.Generic.List[object]]::new()
                 $cluster.Add($fi)
-                # Mode series : code episode de fi
-                $epI = if ($mode -eq 'series') { Get-EpisodeKey $fi.Name } else { $null }
-                # Mode video/films/series : durée MediaInfo de fi (si disponible)
+                $epI         = if ($mode -eq 'series') { Get-EpisodeKey $fi.Name } else { $null }
                 $isVideoMode = $mode -in @('video','films','series')
-                $metaI = if ($isVideoMode -and $mediaInfoPath) { Get-VideoMeta $fi.FullName } else { $null }
+                $metaI       = if ($isVideoMode) { Get-VideoMeta $fi.FullName } else { $null }
+
                 for ($j = $i+1; $j -lt $sameSize.Count; $j++) {
                     $fj = $sameSize[$j]
                     if ($used.Contains($fj.FullName)) { continue }
-                    # Mode series : ignorer si les codes episode sont differents
                     if ($mode -eq 'series' -and $epI -ne '') {
                         $epJ = Get-EpisodeKey $fj.Name
                         if ($epJ -ne '' -and $epJ -ne $epI) { continue }
                     }
-                    # Mode video : si MediaInfo dispo, vérifier durée (tolérance 1s)
-                    # Deux fichiers identiques en taille mais de durées différentes = faux positif
                     if ($metaI -and $metaI.Duration -gt 0) {
                         $metaJ = Get-VideoMeta $fj.FullName
                         if ($metaJ -and $metaJ.Duration -gt 0) {
-                            $durDiffMs = [Math]::Abs($metaI.Duration - $metaJ.Duration)
-                            if ($durDiffMs -gt 1000) { continue }  # >1s d'écart = pas une copie
+                            if ([Math]::Abs($metaI.Duration - $metaJ.Duration) -gt 1000) { continue }
                         }
                     }
                     $r = "$($T.ReasonExact) ($szStr)"
@@ -1617,87 +1809,79 @@ $script:scanBlock = {
             }
         }
 
-        # ════ PHASE 4 : Détection par titre normalisé (45→100%) ════
-            $bArr = @($buckets.GetEnumerator())
-            $bT = $bArr.Count; $bD = 0
+        # ════ PHASE 4 : Détection par titre normalisé (60→100%) ════
+        $bArr = @($buckets.GetEnumerator())
+        $bT = $bArr.Count; $bD = 0
 
-            foreach ($entry in $bArr) {
-                if ($state.Cancelled) { break }
-                $bD++
-                $state.Progress = 45 + [int](($bD / [Math]::Max($bT, 1)) * 55)
-                $bucket = @($entry.Value)
-                if ($bucket.Count -lt 2) { continue }
-                $state.StepMsg = "$($T.AnalyzeTitles) [$bD/$bT] '$($entry.Key)'"
+        foreach ($entry in $bArr) {
+            if ($state.Cancelled) { break }
+            $bD++
+            $state.Progress = 60 + [int](($bD / [Math]::Max($bT, 1)) * 40)
+            $bucket = @($entry.Value)
+            if ($bucket.Count -lt 2) { continue }
+            $state.StepMsg = "$($T.AnalyzeTitles) [$bD/$bT] '$($entry.Key)'"
 
-                for ($i = 0; $i -lt $bucket.Count; $i++) {
-                    $fi = $bucket[$i]
-                    if ($used.Contains($fi.FullName)) { continue }
-                    $normI = $norms[$fi.FullName]
-                    if ($normI.Length -lt 3) { continue }
+            for ($i = 0; $i -lt $bucket.Count; $i++) {
+                $fi    = $bucket[$i]
+                if ($used.Contains($fi.FullName)) { continue }
+                $normI = if ($norms.ContainsKey($fi.FullName)) { $norms[$fi.FullName] } else { '' }
+                if ($normI.Length -lt 3) { continue }
 
-                    $cluster = [System.Collections.Generic.List[object]]::new()
-                    $cluster.Add($fi)
+                $cluster = [System.Collections.Generic.List[object]]::new()
+                $cluster.Add($fi)
 
-                    for ($j = $i+1; $j -lt $bucket.Count; $j++) {
-                        $fj = $bucket[$j]
-                        if ($used.Contains($fj.FullName)) { continue }
-                        $normJ = $norms[$fj.FullName]
-                        if ($normJ.Length -lt 3) { continue }
+                for ($j = $i+1; $j -lt $bucket.Count; $j++) {
+                    $fj    = $bucket[$j]
+                    if ($used.Contains($fj.FullName)) { continue }
+                    $normJ = if ($norms.ContainsKey($fj.FullName)) { $norms[$fj.FullName] } else { '' }
+                    if ($normJ.Length -lt 3) { continue }
 
-                        # Logique de correspondance selon le mode
-                        $match = $false
-                        $matchDetail = ''
+                    $match = $false; $matchDetail = ''
 
-                        if ($mode -eq 'fichiers') {
-                            # Préfixe commun (≥50% de mots consécutifs identiques)
-                            $wordsI = $normI -split ' '
-                            $wordsJ = $normJ -split ' '
-                            if ($wordsI[0] -eq $wordsJ[0]) {
-                                $common = 0
-                                $minLen = [Math]::Min($wordsI.Count, $wordsJ.Count)
-                                for ($k = 0; $k -lt $minLen; $k++) {
-                                    if ($wordsI[$k] -eq $wordsJ[$k]) { $common++ } else { break }
-                                }
-                                $match = ($common / [Math]::Max($wordsI.Count, $wordsJ.Count)) -ge 0.5
+                    if ($mode -eq 'fichiers') {
+                        $wordsI = $normI -split ' '
+                        $wordsJ = $normJ -split ' '
+                        if ($wordsI[0] -eq $wordsJ[0]) {
+                            $common = 0; $minLen = [Math]::Min($wordsI.Count, $wordsJ.Count)
+                            for ($k = 0; $k -lt $minLen; $k++) {
+                                if ($wordsI[$k] -eq $wordsJ[$k]) { $common++ } else { break }
                             }
-                        } elseif ($mode -eq 'musique') {
-                            # Clé musique : "artist|title|durSec"
-                            # Correspondance exacte artiste+titre, tolérance ±3s sur durée
-                            $partsI = $normI -split '\|'
-                            $partsJ = $normJ -split '\|'
-                            if ($partsI.Count -ge 3 -and $partsJ.Count -ge 3) {
-                                $sameArtistTitle = ($partsI[0] -eq $partsJ[0]) -and ($partsI[1] -eq $partsJ[1])
-                                $durDiff = [Math]::Abs([int]$partsI[2] - [int]$partsJ[2])
-                                if ($sameArtistTitle -and $durDiff -le 3) {
-                                    $match = $true
-                                    $matchDetail = if ($durDiff -gt 0) { " (durée diff. ${durDiff}s)" } else { '' }
-                                }
-                            } elseif ($partsI.Count -lt 3 -and $partsJ.Count -lt 3) {
-                                # Fallback nom normalisé (pas de metadata)
-                                $match = ($normI -eq $normJ)
+                            $match = ($common / [Math]::Max($wordsI.Count, $wordsJ.Count)) -ge 0.5
+                        }
+                    } elseif ($mode -eq 'musique') {
+                        $partsI = $normI -split '\|'
+                        $partsJ = $normJ -split '\|'
+                        if ($partsI.Count -ge 3 -and $partsJ.Count -ge 3) {
+                            $sameAT  = ($partsI[0] -eq $partsJ[0]) -and ($partsI[1] -eq $partsJ[1])
+                            $durDiff = [Math]::Abs([int]$partsI[2] - [int]$partsJ[2])
+                            if ($sameAT -and $durDiff -le 3) {
+                                $match = $true
+                                $matchDetail = if ($durDiff -gt 0) { " (durée diff. ${durDiff}s)" } else { '' }
                             }
-                        } else {
+                        } elseif ($partsI.Count -lt 3 -and $partsJ.Count -lt 3) {
                             $match = ($normI -eq $normJ)
                         }
-
-                        if ($match) {
-                            $reason = switch ($mode) {
-                                'films'    { $T.ReasonFilm }
-                                'series'   { $T.ReasonSerie }
-                                'fichiers' { $T.ReasonFichier }
-                                'musique'  { "$($T.ReasonMusique)$matchDetail" }
-                                default    { $T.ReasonVideoTitle }
-                            }
-                            $fj | Add-Member -NotePropertyName Reason -NotePropertyValue $reason -Force
-                            if ($cluster.Count -eq 1) { $fi | Add-Member -NotePropertyName Reason -NotePropertyValue $reason -Force }
-                            $cluster.Add($fj)
-                            $used.Add($fj.FullName) | Out-Null
-                        }
+                    } else {
+                        $match = ($normI -eq $normJ)
                     }
 
-                    if ($cluster.Count -gt 1) { $used.Add($fi.FullName) | Out-Null; $groups.Add($cluster) }
+                    if ($match) {
+                        $reason = switch ($mode) {
+                            'films'    { $T.ReasonFilm }
+                            'series'   { $T.ReasonSerie }
+                            'fichiers' { $T.ReasonFichier }
+                            'musique'  { "$($T.ReasonMusique)$matchDetail" }
+                            default    { $T.ReasonVideoTitle }
+                        }
+                        $fj | Add-Member -NotePropertyName Reason -NotePropertyValue $reason -Force
+                        if ($cluster.Count -eq 1) { $fi | Add-Member -NotePropertyName Reason -NotePropertyValue $reason -Force }
+                        $cluster.Add($fj)
+                        $used.Add($fj.FullName) | Out-Null
+                    }
                 }
+                if ($cluster.Count -gt 1) { $used.Add($fi.FullName) | Out-Null; $groups.Add($cluster) }
             }
+        }
 
         $state.Progress = 100
         $state.StepMsg  = $T.ScanDone
